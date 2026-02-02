@@ -25,6 +25,8 @@ export interface LayerDefinition {
   readonly line: number
   readonly dependencies: ReadonlyArray<string>
   readonly errorTypes: ReadonlyArray<string>
+  readonly isParametrized: boolean
+  readonly factoryName?: string
 }
 
 export interface ArchitectureGraph {
@@ -45,7 +47,9 @@ interface GraphMetrics {
 
 const SERVICE_TAG_PATTERN = /export\s+const\s+(\w+)\s*=\s*Context\.GenericTag<\1>/g
 
-const LAYER_PATTERN = /(export\s+)?const\s+(\w+)[\s\S]*?Layer\.(scoped|effect|succeed|sync)\s*\(\s*(\w+)\s*,/g
+const LAYER_PATTERN = /(export\s+)?const\s+(\w+)(?:\s*:\s*Layer\.Layer<[\s\S]*?>)?\s*=\s*Layer\.(scoped|effect|succeed|sync)\s*\(\s*([\w.]+)\s*,/gm
+
+const FACTORY_PATTERN = /(export\s+)?const\s+(\w+)\s*=\s*\([^)]*\)\s*(?::\s*[^=]+)?\s*=>\s*(?:\{[^}]*(?:return\s+)?|)Layer\.(scoped|effect|succeed|sync)\s*\(\s*([\w.]+)\s*,/gm
 
 const EFFECT_INFRASTRUCTURE = new Set([
   "never",
@@ -87,26 +91,50 @@ interface LayerMatch {
   readonly name: string
   readonly serviceName: string
   readonly line: number
+  readonly isParametrized: boolean
+  readonly factoryName?: string
 }
 
 export const extractLayerMatches = (
   content: string
 ): ReadonlyArray<LayerMatch> => {
   const results: LayerMatch[] = []
-  LAYER_PATTERN.lastIndex = 0
 
+  LAYER_PATTERN.lastIndex = 0
   let match: RegExpExecArray | null
   while ((match = LAYER_PATTERN.exec(content)) !== null) {
-    const isExported = match[1] !== undefined
     const varName = match[2]
     const layerType = match[3]
-    const serviceName = match[4]
+    const serviceNameRaw = match[4]
+    const serviceName = serviceNameRaw.includes('.')
+      ? serviceNameRaw.split('.').pop() ?? serviceNameRaw
+      : serviceNameRaw
+
+    results.push({
+      name: varName,
+      serviceName: serviceName,
+      line: countLinesBefore(content, match.index),
+      isParametrized: false
+    })
+  }
+
+  FACTORY_PATTERN.lastIndex = 0
+  while ((match = FACTORY_PATTERN.exec(content)) !== null) {
+    const isExported = match[1] !== undefined
+    const factoryName = match[2]
+    const layerType = match[3]
+    const serviceNameRaw = match[4]
+    const serviceName = serviceNameRaw.includes('.')
+      ? serviceNameRaw.split('.').pop() ?? serviceNameRaw
+      : serviceNameRaw
 
     if (isExported) {
       results.push({
-        name: varName,
+        name: factoryName,
         serviceName: serviceName,
-        line: countLinesBefore(content, match.index)
+        line: countLinesBefore(content, match.index),
+        isParametrized: true,
+        factoryName: factoryName
       })
     }
   }
@@ -125,8 +153,14 @@ const extractDepsFromType = (
   checker: ts.TypeChecker
 ): ReadonlyArray<string> => {
   const deps: string[] = []
+  const visited = new Set<ts.Type>()
 
   const processType = (t: ts.Type): void => {
+    if (visited.has(t)) return
+    visited.add(t)
+
+    const typeString = checker.typeToString(t)
+
     if (t.isUnion()) {
       for (const unionMember of t.types) {
         processType(unionMember)
@@ -142,6 +176,65 @@ const extractDepsFromType = (
     }
 
     const symbol = t.getSymbol() ?? t.aliasSymbol
+    const symbolName = symbol?.getName()
+
+    const typeRef = t as ts.TypeReference
+    const isTypeReference = typeRef.target && checker.getTypeArguments
+
+    if ((symbolName === "Identifier" || typeString.startsWith("Id<")) && isTypeReference) {
+      const typeArgs = checker.getTypeArguments(typeRef)
+
+      let typeArgString: string | undefined
+
+      if (typeArgs && typeArgs.length > 0) {
+        typeArgString = checker.typeToString(typeArgs[0])
+      } else if (typeString.startsWith("Id<")) {
+        const match = typeString.match(/^Id<(.+)>$/)
+        if (match) {
+          typeArgString = match[1]
+        }
+      }
+
+      if (typeArgString) {
+        if (typeArgString.startsWith("typeof ")) {
+          const typeofContent = typeArgString.slice(7)
+          const parts = typeofContent.split(".")
+          const serviceName = parts[0]
+
+          if (
+            !isEffectInfrastructure(serviceName) &&
+            !isExcludedFromGraph(serviceName) &&
+            !deps.includes(serviceName)
+          ) {
+            deps.push(serviceName)
+          }
+        } else if (typeArgString.startsWith('"@')) {
+          const match = typeArgString.match(/^"@[^/]+\/([^"]+)"$/)
+          if (match) {
+            const serviceName = match[1]
+
+            if (
+              !isEffectInfrastructure(serviceName) &&
+              !isExcludedFromGraph(serviceName) &&
+              !deps.includes(serviceName)
+            ) {
+              deps.push(serviceName)
+            }
+          }
+        }
+      }
+      return
+    }
+
+    if (isTypeReference) {
+      const typeArgs = checker.getTypeArguments(typeRef)
+      if (typeArgs && typeArgs.length > 0) {
+        for (const arg of typeArgs) {
+          processType(arg)
+        }
+      }
+    }
+
     if (symbol) {
       const name = symbol.getName()
       if (
@@ -201,17 +294,23 @@ const extractLayerInfo = (
   }
 
   const moduleSymbol = checker.getSymbolAtLocation(sourceFile)
-  if (!moduleSymbol) return { dependencies: [], errorTypes: [] }
+  if (!moduleSymbol) {
+    return { dependencies: [], errorTypes: [] }
+  }
 
   const exports = checker.getExportsOfModule(moduleSymbol)
   const layerExport = exports.find((s) => s.getName() === layerName)
 
-  if (!layerExport) return { dependencies: [], errorTypes: [] }
+  if (!layerExport) {
+    return { dependencies: [], errorTypes: [] }
+  }
 
   const type = checker.getTypeOfSymbol(layerExport)
   const typeString = checker.typeToString(type)
 
-  if (!typeString.startsWith("Layer<")) return { dependencies: [], errorTypes: [] }
+  if (!typeString.startsWith("Layer<")) {
+    return { dependencies: [], errorTypes: [] }
+  }
 
   const typeRef = type as ts.TypeReference
   const typeArgs = checker.getTypeArguments(typeRef)
@@ -233,18 +332,29 @@ export const createTsProgram = (
     target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
-    strict: true,
+    strict: false,
     esModuleInterop: true,
     skipLibCheck: true,
+    skipDefaultLibCheck: true,
     noEmit: true,
+    allowJs: true,
     lib: ["lib.es2022.d.ts", "lib.dom.d.ts"],
     baseUrl: ".",
     paths: {
-      "~/*": ["./src/*"]
+      "~/*": ["./src/*"],
+      "@/*": ["./src/*"]
     }
   }
 
   return ts.createProgram([...filePaths], compilerOptions)
+}
+
+const DEBUG = process.env.DEBUG_ARCH === '1'
+
+const debugLog = (msg: string) => {
+  if (DEBUG) {
+    console.error(`[DEBUG] ${msg}`)
+  }
 }
 
 export const extractLayersFromContent = (
@@ -265,7 +375,9 @@ export const extractLayersFromContent = (
       path: filePath,
       line: match.line,
       dependencies: layerInfo.dependencies,
-      errorTypes: layerInfo.errorTypes
+      errorTypes: layerInfo.errorTypes,
+      isParametrized: match.isParametrized,
+      factoryName: match.factoryName
     }
   })
 }
@@ -1498,21 +1610,17 @@ const renderEdges = (graph: ArchitectureGraph, analysisGraph: AnalysisGraph): st
   const ordered = orderServicesByDependencyCount(graph, analysisGraph)
 
   const edgeLines = ordered.map((item) => {
-    const deps = pipe(
-      Graph.neighbors(analysisGraph.graph, item.index),
-      Array.filterMap((depIndex) => {
-        const node = Graph.getNode(analysisGraph.graph, depIndex)
-        return Option.isSome(node) ? Option.some(node.value.name) : Option.none()
-      })
-    )
+    const deps = item.layer?.dependencies ?? []
 
     const errorTypes = item.layer?.errorTypes ?? []
     const serviceName = item.service.name
+    const isParametrized = item.layer?.isParametrized ?? false
 
     const errorUnion = errorTypes.length > 0 ? errorTypes.join(" | ") : "never"
     const depUnion = deps.length > 0 ? deps.join(" | ") : "never"
 
-    return `  ${serviceName}<${errorUnion}, ${depUnion}>`
+    const prefix = isParametrized ? "() => " : ""
+    return `  ${prefix}${serviceName}<${errorUnion}, ${depUnion}>`
   })
 
   return `<adjacency_list n="${graph.services.length}">\n${edgeLines.join("\n")}\n</adjacency_list>`
@@ -1581,6 +1689,18 @@ const renderWarnings = (
     sections.push(`  </wide>`)
   } else {
     sections.push(`  <wide n="0" description="${wideDesc}" />`)
+  }
+
+  const parametrizedLayers = graph.layers.filter(layer => layer.isParametrized)
+  const parametrizedDesc = "Layers created by factory functions. May indicate runtime configuration or non-static dependencies."
+  if (parametrizedLayers.length > 0) {
+    sections.push(`  <parametrized_layers n="${parametrizedLayers.length}" severity="moderate" description="${parametrizedDesc}">`)
+    parametrizedLayers.forEach((layer) => {
+      sections.push(`    ${layer.serviceName} (${layer.factoryName})`)
+    })
+    sections.push(`  </parametrized_layers>`)
+  } else {
+    sections.push(`  <parametrized_layers n="0" severity="moderate" description="${parametrizedDesc}" />`)
   }
 
   sections.push("</warnings>")
@@ -1788,72 +1908,88 @@ const renderWorkflows = (expanded: boolean): string => {
   return lines.join("\n")
 }
 
-const renderDebugSection = (showWorkflows: boolean): string => {
+const renderCommandsSummary = (expanded: boolean): string => {
+  const lines: string[] = []
+
+  if (expanded) {
+    lines.push("  <available_commands>")
+
+    lines.push("    <command name=\"blast-radius\">")
+    lines.push("      <usage>architecture blast-radius SERVICE_NAME</usage>")
+    lines.push("      <description>Shows downstream impact: all services that depend on this (full transitive closure)</description>")
+    lines.push("      <when_to_use>Before making changes to assess blast radius and testing scope</when_to_use>")
+    lines.push("      <example>architecture blast-radius TodoQueryService</example>")
+    lines.push("      <output>Risk level (HIGH/MEDIUM/LOW), all affected services grouped by depth (unlimited depth)</output>")
+    lines.push("    </command>")
+
+    lines.push("    <command name=\"ancestors\">")
+    lines.push("      <usage>architecture ancestors SERVICE_NAME</usage>")
+    lines.push("      <description>Shows all upstream dependencies (full transitive closure)</description>")
+    lines.push("      <when_to_use>To understand complete dependency tree of a service</when_to_use>")
+    lines.push("      <example>architecture ancestors SidebarVM</example>")
+    lines.push("      <output>All dependencies grouped by depth level (unlimited depth)</output>")
+    lines.push("    </command>")
+
+    lines.push("    <command name=\"common-ancestors\">")
+    lines.push("      <usage>architecture common-ancestors SERVICE1 SERVICE2 ...</usage>")
+    lines.push("      <description>Finds shared dependencies across multiple services</description>")
+    lines.push("      <when_to_use>When multiple services fail - identifies root cause candidates</when_to_use>")
+    lines.push("      <example>architecture common-ancestors SidebarVM DetailPanelVM StatsPanelVM</example>")
+    lines.push("      <output>Shared dependencies ranked by coverage percentage, root cause candidates</output>")
+    lines.push("    </command>")
+
+    lines.push("    <command name=\"metrics\">")
+    lines.push("      <usage>architecture metrics</usage>")
+    lines.push("      <description>Quick health check showing only graph metrics</description>")
+    lines.push("      <when_to_use>Fast health assessment or trending over time</when_to_use>")
+    lines.push("      <output>Density, diameter, average degree with interpretation thresholds</output>")
+    lines.push("    </command>")
+
+    lines.push("    <command name=\"domains\">")
+    lines.push("      <usage>architecture domains</usage>")
+    lines.push("      <description>Discover architectural domains via cut vertex detection</description>")
+    lines.push("      <when_to_use>Understanding module boundaries, planning package splits or microservices</when_to_use>")
+    lines.push("      <output>Domain bridges (cut vertices) and grouped services by domain</output>")
+    lines.push("    </command>")
+
+    lines.push("    <command name=\"hot-services\">")
+    lines.push("      <usage>architecture hot-services</usage>")
+    lines.push("      <description>Lists high-risk services with many dependents (≥4)</description>")
+    lines.push("      <when_to_use>Identifying critical infrastructure needing stability and comprehensive testing</when_to_use>")
+    lines.push("      <output>Services ranked by dependent count</output>")
+    lines.push("    </command>")
+
+    lines.push("    <command name=\"format\">")
+    lines.push("      <usage>architecture format --format FORMAT</usage>")
+    lines.push("      <description>Output analysis in different formats: mermaid, human, adjacency</description>")
+    lines.push("      <when_to_use>Visualization (mermaid) or data export (adjacency)</when_to_use>")
+    lines.push("      <example>architecture format --format mermaid --output diagram.mmd</example>")
+    lines.push("      <formats>")
+    lines.push("        <format name=\"mermaid\">Flowchart diagram for visualization</format>")
+    lines.push("        <format name=\"human\">Tree structure with root/intermediate/leaf/VM grouping</format>")
+    lines.push("        <format name=\"adjacency\">Simple list format for data export</format>")
+    lines.push("      </formats>")
+    lines.push("    </command>")
+
+    lines.push("  </available_commands>")
+  } else {
+    lines.push("  <available_commands collapsed=\"true\">")
+    lines.push("    <hint>Run with --commands for full command documentation</hint>")
+    lines.push("    <available>blast-radius, ancestors, common-ancestors, metrics, domains, hot-services, format</available>")
+    lines.push("  </available_commands>")
+  }
+
+  return lines.join("\n")
+}
+
+const renderDebugSection = (showWorkflows: boolean, showCommands: boolean): string => {
   const lines: string[] = []
 
   lines.push("<debug>")
   lines.push("  <hint>For impact analysis and debugging, these commands are available</hint>")
   lines.push("  ")
-  lines.push("  <available_commands>")
 
-  lines.push("    <command name=\"blast-radius\">")
-  lines.push("      <usage>architecture blast-radius SERVICE_NAME</usage>")
-  lines.push("      <description>Shows downstream impact: all services that depend on this (full transitive closure)</description>")
-  lines.push("      <when_to_use>Before making changes to assess blast radius and testing scope</when_to_use>")
-  lines.push("      <example>architecture blast-radius TodoQueryService</example>")
-  lines.push("      <output>Risk level (HIGH/MEDIUM/LOW), all affected services grouped by depth (unlimited depth)</output>")
-  lines.push("    </command>")
-
-  lines.push("    <command name=\"ancestors\">")
-  lines.push("      <usage>architecture ancestors SERVICE_NAME</usage>")
-  lines.push("      <description>Shows all upstream dependencies (full transitive closure)</description>")
-  lines.push("      <when_to_use>To understand complete dependency tree of a service</when_to_use>")
-  lines.push("      <example>architecture ancestors SidebarVM</example>")
-  lines.push("      <output>All dependencies grouped by depth level (unlimited depth)</output>")
-  lines.push("    </command>")
-
-  lines.push("    <command name=\"common-ancestors\">")
-  lines.push("      <usage>architecture common-ancestors SERVICE1 SERVICE2 ...</usage>")
-  lines.push("      <description>Finds shared dependencies across multiple services</description>")
-  lines.push("      <when_to_use>When multiple services fail - identifies root cause candidates</when_to_use>")
-  lines.push("      <example>architecture common-ancestors SidebarVM DetailPanelVM StatsPanelVM</example>")
-  lines.push("      <output>Shared dependencies ranked by coverage percentage, root cause candidates</output>")
-  lines.push("    </command>")
-
-  lines.push("    <command name=\"metrics\">")
-  lines.push("      <usage>architecture metrics</usage>")
-  lines.push("      <description>Quick health check showing only graph metrics</description>")
-  lines.push("      <when_to_use>Fast health assessment or trending over time</when_to_use>")
-  lines.push("      <output>Density, diameter, average degree with interpretation thresholds</output>")
-  lines.push("    </command>")
-
-  lines.push("    <command name=\"domains\">")
-  lines.push("      <usage>architecture domains</usage>")
-  lines.push("      <description>Discover architectural domains via cut vertex detection</description>")
-  lines.push("      <when_to_use>Understanding module boundaries, planning package splits or microservices</when_to_use>")
-  lines.push("      <output>Domain bridges (cut vertices) and grouped services by domain</output>")
-  lines.push("    </command>")
-
-  lines.push("    <command name=\"hot-services\">")
-  lines.push("      <usage>architecture hot-services</usage>")
-  lines.push("      <description>Lists high-risk services with many dependents (≥4)</description>")
-  lines.push("      <when_to_use>Identifying critical infrastructure needing stability and comprehensive testing</when_to_use>")
-  lines.push("      <output>Services ranked by dependent count</output>")
-  lines.push("    </command>")
-
-  lines.push("    <command name=\"format\">")
-  lines.push("      <usage>architecture format --format FORMAT</usage>")
-  lines.push("      <description>Output analysis in different formats: mermaid, human, adjacency</description>")
-  lines.push("      <when_to_use>Visualization (mermaid) or data export (adjacency)</when_to_use>")
-  lines.push("      <example>architecture format --format mermaid --output diagram.mmd</example>")
-  lines.push("      <formats>")
-  lines.push("        <format name=\"mermaid\">Flowchart diagram for visualization</format>")
-  lines.push("        <format name=\"human\">Tree structure with root/intermediate/leaf/VM grouping</format>")
-  lines.push("        <format name=\"adjacency\">Simple list format for data export</format>")
-  lines.push("      </formats>")
-  lines.push("    </command>")
-
-  lines.push("  </available_commands>")
+  lines.push(renderCommandsSummary(showCommands))
   lines.push("  ")
 
   lines.push(renderWorkflows(showWorkflows))
@@ -1897,6 +2033,7 @@ interface RenderOptions {
   readonly showAdvanced: boolean
   readonly showWarnings: boolean
   readonly showWorkflows: boolean
+  readonly showCommands: boolean
 }
 
 export const formatAgentWithHints = (
@@ -2002,7 +2139,7 @@ export const formatAgentWithHints = (
   output.push(renderViolations(graph, analysisGraph))
   output.push("")
 
-  output.push(renderDebugSection(options.showWorkflows))
+  output.push(renderDebugSection(options.showWorkflows, options.showCommands))
   output.push("")
 
   output.push("</architecture>")

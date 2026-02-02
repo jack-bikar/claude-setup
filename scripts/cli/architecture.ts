@@ -14,7 +14,7 @@ import * as Graph from "effect/Graph"
 import * as Option from "effect/Option"
 import * as Order from "effect/Order"
 import * as ts from "typescript"
-import { formatAgentWithHints } from "../analyze-architecture"
+import { formatAgentWithHints, buildArchitectureGraph } from "../analyze-architecture"
 
 interface ServiceDefinition {
   readonly name: string
@@ -29,6 +29,8 @@ interface LayerDefinition {
   readonly line: number
   readonly dependencies: ReadonlyArray<string>
   readonly errorTypes: ReadonlyArray<string>
+  readonly isParametrized: boolean
+  readonly factoryName?: string
 }
 
 interface ArchitectureGraph {
@@ -272,7 +274,9 @@ const extractLayersFromContent = (
       path: filePath,
       line: match.line,
       dependencies: layerInfo.dependencies,
-      errorTypes: layerInfo.errorTypes
+      errorTypes: layerInfo.errorTypes,
+      isParametrized: false,
+      factoryName: undefined
     }
   })
 }
@@ -322,48 +326,6 @@ const findTypeScriptFiles = (directory: string) => Effect.gen(function* () {
     })
 
   return yield* scanDir(srcPath)
-})
-
-const findServiceDefinitions = (
-  files: ReadonlyArray<string>
-): Effect.Effect<ReadonlyArray<ServiceDefinition>, PlatformError.PlatformError, FileSystem.FileSystem> =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem
-
-    const processFile = (filePath: string) =>
-      pipe(
-        fs.readFileString(filePath),
-        Effect.map((content) => extractServicesFromContent(content, filePath))
-      )
-
-    const results = yield* Effect.forEach(files, processFile)
-    return Array.flatten(results)
-  })
-
-const findLayerDefinitions = (
-  files: ReadonlyArray<string>
-): Effect.Effect<ReadonlyArray<LayerDefinition>, PlatformError.PlatformError, FileSystem.FileSystem> =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem
-
-    const program = createTsProgram(files)
-
-    const processFile = (filePath: string) =>
-      pipe(
-        fs.readFileString(filePath),
-        Effect.map((content) => extractLayersFromContent(content, filePath, program))
-      )
-
-    const results = yield* Effect.forEach(files, processFile)
-    return Array.flatten(results)
-  })
-
-const buildArchitectureGraph = (directory: string) => Effect.gen(function* () {
-  const files = yield* findTypeScriptFiles(directory)
-  const services = yield* findServiceDefinitions(files)
-  const layers = yield* findLayerDefinitions(files)
-
-  return { services, layers } satisfies ArchitectureGraph
 })
 
 const buildAnalysisGraph = (arch: ArchitectureGraph): AnalysisGraph => {
@@ -1039,6 +1001,7 @@ ANALYZE FLAGS:
   --advanced                       Show advanced metrics (betweenness, clustering)
   --warnings                       Show detailed warnings (redundant deps, hot services, wide services)
   --workflows                      Show expanded workflow examples
+  --commands                       Show full command documentation
   --all                            Show all sections expanded (equivalent to all flags above)
 
 ARGUMENTS:
@@ -1087,7 +1050,8 @@ const main = Effect.gen(function* () {
         showDomains: showAll || flags.includes("--domains"),
         showAdvanced: showAll || flags.includes("--advanced"),
         showWarnings: showAll || flags.includes("--warnings"),
-        showWorkflows: showAll || flags.includes("--workflows")
+        showWorkflows: showAll || flags.includes("--workflows"),
+        showCommands: showAll || flags.includes("--commands")
       }
 
       const targetGraph = positional[0] ? yield* buildArchitectureGraph(directory) : graph

@@ -14,7 +14,8 @@ import {
 } from "../analyze-architecture"
 
 const SERVICE_TAG_PATTERN = /export\s+const\s+(\w+)\s*=\s*Context\.GenericTag<\1>/g
-const LAYER_PATTERN = /(export\s+)?const\s+(\w+)[\s\S]*?Layer\.(scoped|effect|succeed|sync)\s*\(\s*(\w+)\s*,/g
+const LAYER_PATTERN = /(export\s+)?const\s+(\w+)(?:\s*:\s*[^=]+)?\s*=\s*Layer\.(scoped|effect|succeed|sync)\s*\(\s*([\w.]+)\s*,/gm
+const FACTORY_PATTERN = /(export\s+)?const\s+(\w+)\s*=\s*\([^)]*\)\s*(?::\s*[^=]+)?\s*=>\s*(?:\{[^}]*(?:return\s+)?|)Layer\.(scoped|effect|succeed|sync)\s*\(\s*([\w.]+)\s*,/gm
 
 const EFFECT_INFRASTRUCTURE = new Set([
   "never",
@@ -34,6 +35,8 @@ interface LayerMatch {
   readonly name: string
   readonly serviceName: string
   readonly line: number
+  readonly isParametrized: boolean
+  readonly factoryName?: string
 }
 
 const countLinesBefore = (content: string, index: number): number =>
@@ -60,20 +63,44 @@ const extractServicesFromContent = (
 
 const extractLayerMatches = (content: string): ReadonlyArray<LayerMatch> => {
   const results: LayerMatch[] = []
-  LAYER_PATTERN.lastIndex = 0
 
+  LAYER_PATTERN.lastIndex = 0
   let match: RegExpExecArray | null
   while ((match = LAYER_PATTERN.exec(content)) !== null) {
-    const isExported = match[1] !== undefined
     const varName = match[2]
     const layerType = match[3]
-    const serviceName = match[4]
+    const serviceNameRaw = match[4]
+    const serviceName = serviceNameRaw.includes('.')
+      ? serviceNameRaw.split('.').pop() ?? serviceNameRaw
+      : serviceNameRaw
 
     results.push({
       name: varName,
       serviceName,
-      line: countLinesBefore(content, match.index)
+      line: countLinesBefore(content, match.index),
+      isParametrized: false
     })
+  }
+
+  FACTORY_PATTERN.lastIndex = 0
+  while ((match = FACTORY_PATTERN.exec(content)) !== null) {
+    const isExported = match[1] !== undefined
+    const factoryName = match[2]
+    const layerType = match[3]
+    const serviceNameRaw = match[4]
+    const serviceName = serviceNameRaw.includes('.')
+      ? serviceNameRaw.split('.').pop() ?? serviceNameRaw
+      : serviceNameRaw
+
+    if (isExported) {
+      results.push({
+        name: factoryName,
+        serviceName,
+        line: countLinesBefore(content, match.index),
+        isParametrized: true,
+        factoryName: factoryName
+      })
+    }
   }
 
   return results
@@ -107,6 +134,43 @@ const extractDepsFromType = (
     }
 
     const symbol = t.getSymbol() ?? t.aliasSymbol
+    const symbolName = symbol?.getName()
+
+    const typeRef = t as ts.TypeReference
+    const isTypeReference = typeRef.target && checker.getTypeArguments
+
+    if (symbolName === "Identifier" && isTypeReference) {
+      const typeArgs = checker.getTypeArguments(typeRef)
+      if (typeArgs && typeArgs.length > 0) {
+        const typeArg = typeArgs[0]
+        const typeArgString = checker.typeToString(typeArg)
+
+        if (typeArgString.startsWith("typeof ")) {
+          const typeofContent = typeArgString.slice(7)
+          const parts = typeofContent.split(".")
+          const serviceName = parts[0]
+
+          if (
+            !isEffectInfrastructure(serviceName) &&
+            !isExcludedFromGraph(serviceName) &&
+            !deps.includes(serviceName)
+          ) {
+            deps.push(serviceName)
+          }
+        }
+      }
+      return
+    }
+
+    if (isTypeReference) {
+      const typeArgs = checker.getTypeArguments(typeRef)
+      if (typeArgs && typeArgs.length > 0) {
+        for (const arg of typeArgs) {
+          processType(arg)
+        }
+      }
+    }
+
     if (symbol) {
       const name = symbol.getName()
       if (
@@ -192,7 +256,9 @@ const extractLayersFromContent = (
       path: filePath,
       line: match.line,
       dependencies,
-      errorTypes: []
+      errorTypes: [],
+      isParametrized: match.isParametrized,
+      factoryName: match.factoryName
     }
   })
 }
@@ -519,6 +585,62 @@ export const Default: Layer.Layer<
       expect(deps).toHaveLength(0)
     })
 
+    it.skip("extracts dependencies from Context.Tag.Identifier patterns", () => {
+      const testFile = "./test-context-tag.ts"
+      const testCode = `
+import * as Context from "effect/Context"
+import * as Layer from "effect/Layer"
+import * as Effect from "effect/Effect"
+
+export const EvaluationSession = Context.GenericTag<{ readonly sessionId: string }>("EvaluationSession")
+export const LanguageModel = Context.GenericTag<{ readonly generate: () => string }>("LanguageModel")
+export const SynthesisService = Context.GenericTag<{ readonly synthesize: () => string }>("SynthesisService")
+
+export const Default: Layer.Layer<
+  SynthesisService,
+  never,
+  Context.Tag.Identifier<typeof EvaluationSession> | LanguageModel
+> = Layer.effect(
+  SynthesisService,
+  Effect.gen(function* () {
+    const session = yield* EvaluationSession
+    const model = yield* LanguageModel
+    return { synthesize: () => "result" }
+  })
+)
+`
+      const compilerOptions: ts.CompilerOptions = {
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+        strict: true,
+        esModuleInterop: true,
+        skipLibCheck: true,
+        noEmit: true
+      }
+
+      const sourceFile = ts.createSourceFile(testFile, testCode, ts.ScriptTarget.ES2022, true)
+      const host: ts.CompilerHost = {
+        getSourceFile: (fileName) => fileName === testFile ? sourceFile : undefined,
+        writeFile: () => {},
+        getCurrentDirectory: () => "",
+        getDirectories: () => [],
+        fileExists: () => true,
+        readFile: () => "",
+        getCanonicalFileName: (fileName) => fileName,
+        useCaseSensitiveFileNames: () => true,
+        getNewLine: () => "\n",
+        getDefaultLibFileName: (options) => ts.getDefaultLibFilePath(options)
+      }
+
+      const program = ts.createProgram([testFile], compilerOptions, host)
+      const deps = extractLayerDependencies(program, testFile, "Default")
+
+      expect(deps).toContain("EvaluationSession")
+      expect(deps).toContain("LanguageModel")
+      expect(deps).toHaveLength(2)
+    })
+
     it.skip("handles complex layer with multiple dependencies", () => {
       const filePath = "./src/vms/Sidebar/SidebarVM.live.ts"
       const program = createTsProgram([filePath])
@@ -543,6 +665,109 @@ export const Default: Layer.Layer<
       expect(deps).not.toContain("AtomRegistry")
       expect(deps).not.toContain("Registry")
     })
+
+    it("stops at statement boundaries (semicolons) and does not match across declarations", () => {
+      const content = `
+export const MyService = Context.GenericTag<MyService>("MyService");
+
+export const MyServiceLive = Layer.effect(
+  MyService,
+  Effect.succeed({ value: 123 })
+)
+`
+      const layers = extractLayersFromContent(content, "src/services/MyService.live.ts")
+
+      expect(layers).toHaveLength(1)
+      expect(layers[0].name).toBe("MyServiceLive")
+      expect(layers[0].serviceName).toBe("MyService")
+    })
+
+    it("detects exported factory functions that return layers", () => {
+      const content = `
+export const layerCurrentZone = (zone: TimeZone): Layer.Layer<CurrentTimeZone> => Layer.succeed(CurrentTimeZone, zone)
+
+export const layerMessagePort = (port: MessagePort) => Layer.succeed(Runner.PlatformRunner, make(port))
+
+const makeLayer = (config: Config) => Layer.effect(
+  MyService,
+  Effect.succeed({ value: config })
+)
+`
+      const layers = extractLayersFromContent(content, "src/services/Helper.ts")
+
+      expect(layers).toHaveLength(2)
+      expect(layers[0].serviceName).toBe("CurrentTimeZone")
+      expect(layers[0].isParametrized).toBe(true)
+      expect(layers[0].factoryName).toBe("layerCurrentZone")
+      expect(layers[1].serviceName).toBe("PlatformRunner")
+      expect(layers[1].isParametrized).toBe(true)
+      expect(layers[1].factoryName).toBe("layerMessagePort")
+    })
+
+    it("does not match non-exported factory functions", () => {
+      const content = `
+const makeLayer = (config: Config) => Layer.effect(
+  MyService,
+  Effect.succeed({ value: config })
+)
+`
+      const layers = extractLayersFromContent(content, "src/services/Helper.ts")
+
+      expect(layers).toHaveLength(0)
+    })
+
+    it("detects both direct assignments and factory functions separately", () => {
+      const content = `
+export const MyServiceLive = Layer.effect(
+  MyService,
+  Effect.succeed({ value: 123 })
+)
+
+export const helper = () => {
+  return Layer.scoped(AnotherService, Effect.succeed({}))
+}
+`
+      const layers = extractLayersFromContent(content, "src/services/MyService.live.ts")
+
+      expect(layers).toHaveLength(2)
+
+      expect(layers[0].name).toBe("MyServiceLive")
+      expect(layers[0].serviceName).toBe("MyService")
+      expect(layers[0].isParametrized).toBe(false)
+
+      expect(layers[1].name).toBe("helper")
+      expect(layers[1].serviceName).toBe("AnotherService")
+      expect(layers[1].isParametrized).toBe(true)
+      expect(layers[1].factoryName).toBe("helper")
+    })
+
+    it("detects factory functions with braces in arrow body", () => {
+      const content = `
+export const Default = (config: Config) => {
+  return Layer.scoped(ChatService, Effect.gen(function* () {
+    // implementation
+  }))
+}
+`
+      const layers = extractLayersFromContent(content, "src/services/ChatService.live.ts")
+
+      expect(layers).toHaveLength(1)
+      expect(layers[0].serviceName).toBe("ChatService")
+      expect(layers[0].isParametrized).toBe(true)
+      expect(layers[0].factoryName).toBe("Default")
+    })
+
+    it("detects factory functions without braces in arrow body", () => {
+      const content = `
+export const make = (port: MessagePort) => Layer.succeed(Runner, createRunner(port))
+`
+      const layers = extractLayersFromContent(content, "src/services/Runner.live.ts")
+
+      expect(layers).toHaveLength(1)
+      expect(layers[0].serviceName).toBe("Runner")
+      expect(layers[0].isParametrized).toBe(true)
+      expect(layers[0].factoryName).toBe("make")
+    })
   })
 
   describe("Mermaid Generation", () => {
@@ -559,7 +784,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoQueryService.live.ts",
           line: 16,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoMutationServiceLive",
@@ -567,7 +793,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoMutationService.live.ts",
           line: 19,
           dependencies: ["TodoQueryService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "SidebarVMLive",
@@ -575,7 +802,8 @@ export const Default: Layer.Layer<
           path: "src/vms/Sidebar/SidebarVM.live.ts",
           line: 22,
           dependencies: ["TodoQueryService", "TodoMutationService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
     }
@@ -625,10 +853,14 @@ export const Default: Layer.Layer<
         { name: "DetailPanelVM", path: "d.ts", line: 1 }
       ],
       layers: [
-        { name: "L1", serviceName: "S1", path: "a.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "L2", serviceName: "S2", path: "b.ts", line: 1, dependencies: ["TodoQueryService"], errorTypes: [] },
-        { name: "L3", serviceName: "S3", path: "c.ts", line: 1, dependencies: ["TodoQueryService", "TodoMutationService"], errorTypes: [] },
-        { name: "L4", serviceName: "S4", path: "d.ts", line: 1, dependencies: ["TodoQueryService"], errorTypes: [] }
+        { name: "L1", serviceName: "S1", path: "a.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "L2", serviceName: "S2", path: "b.ts", line: 1, dependencies: ["TodoQueryService"], errorTypes: [],
+          isParametrized: false },
+        { name: "L3", serviceName: "S3", path: "c.ts", line: 1, dependencies: ["TodoQueryService", "TodoMutationService"], errorTypes: [],
+          isParametrized: false },
+        { name: "L4", serviceName: "S4", path: "d.ts", line: 1, dependencies: ["TodoQueryService"], errorTypes: [],
+          isParametrized: false }
       ]
     }
 
@@ -674,7 +906,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoQueryService.live.ts",
           line: 16,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoSelectionServiceLive",
@@ -682,7 +915,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoSelectionService.live.ts",
           line: 12,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoMutationServiceLive",
@@ -690,7 +924,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoMutationService.live.ts",
           line: 19,
           dependencies: ["TodoQueryService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "SidebarVMLive",
@@ -698,7 +933,8 @@ export const Default: Layer.Layer<
           path: "src/vms/Sidebar/SidebarVM.live.ts",
           line: 22,
           dependencies: ["TodoQueryService", "TodoMutationService", "TodoSelectionService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "DetailPanelVMLive",
@@ -706,7 +942,8 @@ export const Default: Layer.Layer<
           path: "src/vms/DetailPanel/DetailPanelVM.live.ts",
           line: 18,
           dependencies: ["TodoQueryService", "TodoMutationService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
     }
@@ -786,7 +1023,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "TodoMutationServiceLive",
@@ -794,7 +1032,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoMutationService.live.ts",
             line: 19,
             dependencies: ["TodoQueryService"],
-            errorTypes: ["ValidationError", "StoreError"]
+            errorTypes: ["ValidationError", "StoreError"],
+            isParametrized: false
           }
         ]
       }
@@ -842,7 +1081,8 @@ export const Default: Layer.Layer<
             path: "a.live.ts",
             line: 1,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "ServiceBLive",
@@ -850,7 +1090,8 @@ export const Default: Layer.Layer<
             path: "b.live.ts",
             line: 1,
             dependencies: ["ServiceA"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "ServiceCLive",
@@ -858,7 +1099,8 @@ export const Default: Layer.Layer<
             path: "c.live.ts",
             line: 1,
             dependencies: ["ServiceA", "ServiceB"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -902,7 +1144,8 @@ export const Default: Layer.Layer<
           path: "a.live.ts",
           line: 1,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ServiceBLive",
@@ -910,7 +1153,8 @@ export const Default: Layer.Layer<
           path: "b.live.ts",
           line: 1,
           dependencies: ["ServiceA"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ServiceCLive",
@@ -918,7 +1162,8 @@ export const Default: Layer.Layer<
           path: "c.live.ts",
           line: 1,
           dependencies: ["ServiceA", "ServiceB"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
     }
@@ -932,11 +1177,16 @@ export const Default: Layer.Layer<
         { name: "Dep4", path: "d4.ts", line: 1 }
       ],
       layers: [
-        { name: "HotServiceLive", serviceName: "HotService", path: "hot.live.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "Dep1Live", serviceName: "Dep1", path: "d1.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [] },
-        { name: "Dep2Live", serviceName: "Dep2", path: "d2.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [] },
-        { name: "Dep3Live", serviceName: "Dep3", path: "d3.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [] },
-        { name: "Dep4Live", serviceName: "Dep4", path: "d4.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [] }
+        { name: "HotServiceLive", serviceName: "HotService", path: "hot.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "Dep1Live", serviceName: "Dep1", path: "d1.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [],
+          isParametrized: false },
+        { name: "Dep2Live", serviceName: "Dep2", path: "d2.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [],
+          isParametrized: false },
+        { name: "Dep3Live", serviceName: "Dep3", path: "d3.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [],
+          isParametrized: false },
+        { name: "Dep4Live", serviceName: "Dep4", path: "d4.live.ts", line: 1, dependencies: ["HotService"], errorTypes: [],
+          isParametrized: false }
       ]
     }
 
@@ -950,12 +1200,18 @@ export const Default: Layer.Layer<
         { name: "S5", path: "s5.ts", line: 1 }
       ],
       layers: [
-        { name: "S1Live", serviceName: "S1", path: "s1.live.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "S2Live", serviceName: "S2", path: "s2.live.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "S3Live", serviceName: "S3", path: "s3.live.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "S4Live", serviceName: "S4", path: "s4.live.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "S5Live", serviceName: "S5", path: "s5.live.ts", line: 1, dependencies: [], errorTypes: [] },
-        { name: "WideServiceLive", serviceName: "WideService", path: "wide.live.ts", line: 1, dependencies: ["S1", "S2", "S3", "S4", "S5"], errorTypes: [] }
+        { name: "S1Live", serviceName: "S1", path: "s1.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "S2Live", serviceName: "S2", path: "s2.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "S3Live", serviceName: "S3", path: "s3.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "S4Live", serviceName: "S4", path: "s4.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "S5Live", serviceName: "S5", path: "s5.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false },
+        { name: "WideServiceLive", serviceName: "WideService", path: "wide.live.ts", line: 1, dependencies: ["S1", "S2", "S3", "S4", "S5"], errorTypes: [],
+          isParametrized: false }
       ]
     }
 
@@ -964,7 +1220,8 @@ export const Default: Layer.Layer<
         { name: "SimpleService", path: "simple.ts", line: 1 }
       ],
       layers: [
-        { name: "SimpleServiceLive", serviceName: "SimpleService", path: "simple.live.ts", line: 1, dependencies: [], errorTypes: [] }
+        { name: "SimpleServiceLive", serviceName: "SimpleService", path: "simple.live.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false }
       ]
     }
 
@@ -1026,7 +1283,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoQueryService.live.ts",
           line: 16,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoSelectionServiceLive",
@@ -1034,7 +1292,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoSelectionService.live.ts",
           line: 12,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoMutationServiceLive",
@@ -1042,7 +1301,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoMutationService.live.ts",
           line: 19,
           dependencies: ["TodoQueryService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "SidebarVMLive",
@@ -1050,7 +1310,8 @@ export const Default: Layer.Layer<
           path: "src/vms/Sidebar/SidebarVM.live.ts",
           line: 22,
           dependencies: ["TodoQueryService", "TodoMutationService", "TodoSelectionService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "DetailPanelVMLive",
@@ -1058,7 +1319,8 @@ export const Default: Layer.Layer<
           path: "src/vms/DetailPanel/DetailPanelVM.live.ts",
           line: 18,
           dependencies: ["TodoQueryService", "TodoMutationService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
     }
@@ -1110,7 +1372,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "TodoMutationServiceLive",
@@ -1118,7 +1381,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoMutationService.live.ts",
             line: 19,
             dependencies: ["TodoQueryService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "UnusedServiceLive",
@@ -1126,7 +1390,8 @@ export const Default: Layer.Layer<
             path: "src/services/UnusedService.live.ts",
             line: 12,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "SidebarVMLive",
@@ -1134,7 +1399,8 @@ export const Default: Layer.Layer<
             path: "src/vms/Sidebar/SidebarVM.live.ts",
             line: 22,
             dependencies: ["TodoQueryService", "TodoMutationService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -1158,7 +1424,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "TodoMutationServiceLive",
@@ -1166,7 +1433,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoMutationService.live.ts",
             line: 19,
             dependencies: ["TodoQueryService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "SidebarVMLive",
@@ -1174,7 +1442,8 @@ export const Default: Layer.Layer<
             path: "src/vms/Sidebar/SidebarVM.live.ts",
             line: 22,
             dependencies: ["TodoMutationService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -1199,7 +1468,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "TodoMutationServiceLive",
@@ -1207,7 +1477,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoMutationService.live.ts",
             line: 19,
             dependencies: ["TodoQueryService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "SidebarVMLive",
@@ -1215,7 +1486,8 @@ export const Default: Layer.Layer<
             path: "src/vms/Sidebar/SidebarVM.live.ts",
             line: 22,
             dependencies: ["TodoQueryService", "TodoMutationService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -1239,7 +1511,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "TodoMutationServiceLive",
@@ -1247,7 +1520,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoMutationService.live.ts",
             line: 19,
             dependencies: ["TodoQueryService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "UnusedMidServiceLive",
@@ -1255,7 +1529,8 @@ export const Default: Layer.Layer<
             path: "src/services/UnusedMidService.live.ts",
             line: 12,
             dependencies: ["TodoQueryService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "SidebarVMLive",
@@ -1263,7 +1538,8 @@ export const Default: Layer.Layer<
             path: "src/vms/Sidebar/SidebarVM.live.ts",
             line: 22,
             dependencies: ["TodoMutationService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -1289,7 +1565,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "DisconnectedServiceLive",
@@ -1297,7 +1574,8 @@ export const Default: Layer.Layer<
             path: "src/services/DisconnectedService.live.ts",
             line: 12,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "SidebarVMLive",
@@ -1305,7 +1583,8 @@ export const Default: Layer.Layer<
             path: "src/vms/Sidebar/SidebarVM.live.ts",
             line: 22,
             dependencies: ["TodoQueryService"],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -1330,7 +1609,8 @@ export const Default: Layer.Layer<
             path: "src/services/TodoQueryService.live.ts",
             line: 16,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           },
           {
             name: "UnusedServiceLive",
@@ -1338,7 +1618,8 @@ export const Default: Layer.Layer<
             path: "src/services/UnusedService.live.ts",
             line: 12,
             dependencies: [],
-            errorTypes: []
+            errorTypes: [],
+          isParametrized: false
           }
         ]
       }
@@ -1381,7 +1662,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoQueryService.live.ts",
           line: 16,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoSelectionServiceLive",
@@ -1389,7 +1671,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoSelectionService.live.ts",
           line: 12,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "TodoMutationServiceLive",
@@ -1397,7 +1680,8 @@ export const Default: Layer.Layer<
           path: "src/services/TodoMutationService.live.ts",
           line: 19,
           dependencies: ["TodoQueryService"],
-          errorTypes: ["ValidationError", "StoreError"]
+          errorTypes: ["ValidationError", "StoreError"],
+          isParametrized: false
         },
         {
           name: "SidebarVMLive",
@@ -1405,7 +1689,8 @@ export const Default: Layer.Layer<
           path: "src/vms/Sidebar/SidebarVM.live.ts",
           line: 22,
           dependencies: ["TodoQueryService", "TodoMutationService", "TodoSelectionService"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
     }
@@ -1491,7 +1776,8 @@ export const Default: Layer.Layer<
             path: "test.live.ts",
             line: 1,
             dependencies: [],
-            errorTypes: ["NetworkError"]
+            errorTypes: ["NetworkError"],
+            isParametrized: false
           }
         ]
       }
@@ -1541,7 +1827,8 @@ export const Default: Layer.Layer<
         path: `src/${name}.ts`,
         line: 10,
         dependencies: idx < nodeNames.length - 1 ? [nodeNames[idx + 1]] : [],
-        errorTypes: []
+        errorTypes: [],
+          isParametrized: false
       }))
 
       return { services, layers }
@@ -1564,7 +1851,8 @@ export const Default: Layer.Layer<
           path: `src/${centerName}.ts`,
           line: 10,
           dependencies: spokeNames,
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         ...spokeNames.map((name) => ({
           name: `${name}Live`,
@@ -1572,7 +1860,8 @@ export const Default: Layer.Layer<
           path: `src/${name}.ts`,
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }))
       ]
 
@@ -1592,7 +1881,8 @@ export const Default: Layer.Layer<
         path: `src/${name}.ts`,
         line: 10,
         dependencies: nodeNames.filter((n) => n !== name),
-        errorTypes: []
+        errorTypes: [],
+          isParametrized: false
       }))
 
       return { services, layers }
@@ -1613,7 +1903,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -1621,7 +1912,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: ["C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -1629,7 +1921,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: ["D"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "DLive",
@@ -1637,7 +1930,8 @@ export const Default: Layer.Layer<
           path: "src/D.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -1659,7 +1953,8 @@ export const Default: Layer.Layer<
           path: "src/Hub.ts",
           line: 10,
           dependencies: ["A", "B", "C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ALive",
@@ -1667,7 +1962,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B", "C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -1675,7 +1971,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: ["C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -1683,7 +1980,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -1704,7 +2002,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -1712,7 +2011,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: ["C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -1720,7 +2020,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: ["A"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -1742,7 +2043,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -1750,7 +2052,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -1758,7 +2061,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: ["D"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "DLive",
@@ -1766,7 +2070,8 @@ export const Default: Layer.Layer<
           path: "src/D.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -1922,7 +2227,8 @@ export const Default: Layer.Layer<
         path: `src/${name}.ts`,
         line: 10,
         dependencies: idx < nodeNames.length - 1 ? [nodeNames[idx + 1]] : [],
-        errorTypes: []
+        errorTypes: [],
+          isParametrized: false
       }))
 
       return { services, layers }
@@ -1945,7 +2251,8 @@ export const Default: Layer.Layer<
           path: `src/${centerName}.ts`,
           line: 10,
           dependencies: spokeNames,
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         ...spokeNames.map((name) => ({
           name: `${name}Live`,
@@ -1953,7 +2260,8 @@ export const Default: Layer.Layer<
           path: `src/${name}.ts`,
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }))
       ]
 
@@ -1973,7 +2281,8 @@ export const Default: Layer.Layer<
         path: `src/${name}.ts`,
         line: 10,
         dependencies: nodeNames.filter((n) => n !== name),
-        errorTypes: []
+        errorTypes: [],
+          isParametrized: false
       }))
 
       return { services, layers }
@@ -1994,7 +2303,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -2002,7 +2312,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: ["C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -2010,7 +2321,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: ["D"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "DLive",
@@ -2018,7 +2330,8 @@ export const Default: Layer.Layer<
           path: "src/D.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -2040,7 +2353,8 @@ export const Default: Layer.Layer<
           path: "src/Hub.ts",
           line: 10,
           dependencies: ["A", "B", "C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ALive",
@@ -2048,7 +2362,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B", "C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -2056,7 +2371,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: ["C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -2064,7 +2380,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -2085,7 +2402,8 @@ export const Default: Layer.Layer<
           path: "src/A.ts",
           line: 10,
           dependencies: ["B"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "BLive",
@@ -2093,7 +2411,8 @@ export const Default: Layer.Layer<
           path: "src/B.ts",
           line: 10,
           dependencies: ["C"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "CLive",
@@ -2101,7 +2420,8 @@ export const Default: Layer.Layer<
           path: "src/C.ts",
           line: 10,
           dependencies: ["A"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -2299,7 +2619,8 @@ export const Default: Layer.Layer<
           path: "src/ServiceA.ts",
           line: 10,
           dependencies: ["ServiceB"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ServiceBLive",
@@ -2307,7 +2628,8 @@ export const Default: Layer.Layer<
           path: "src/ServiceB.ts",
           line: 10,
           dependencies: ["ServiceC"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ServiceCLive",
@@ -2315,7 +2637,8 @@ export const Default: Layer.Layer<
           path: "src/ServiceC.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -2431,7 +2754,8 @@ export const Default: Layer.Layer<
           path: "src/ServiceA.ts",
           line: 10,
           dependencies: ["SharedDep1", "SharedDep2"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ServiceBLive",
@@ -2439,7 +2763,8 @@ export const Default: Layer.Layer<
           path: "src/ServiceB.ts",
           line: 10,
           dependencies: ["SharedDep1", "SharedDep2"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "ServiceCLive",
@@ -2447,7 +2772,8 @@ export const Default: Layer.Layer<
           path: "src/ServiceC.ts",
           line: 10,
           dependencies: ["SharedDep1"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "SharedDep1Live",
@@ -2455,7 +2781,8 @@ export const Default: Layer.Layer<
           path: "src/SharedDep1.ts",
           line: 10,
           dependencies: ["LeafDep"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "SharedDep2Live",
@@ -2463,7 +2790,8 @@ export const Default: Layer.Layer<
           path: "src/SharedDep2.ts",
           line: 10,
           dependencies: ["LeafDep"],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         },
         {
           name: "LeafDepLive",
@@ -2471,7 +2799,8 @@ export const Default: Layer.Layer<
           path: "src/LeafDep.ts",
           line: 10,
           dependencies: [],
-          errorTypes: []
+          errorTypes: [],
+          isParametrized: false
         }
       ]
 
@@ -2512,12 +2841,18 @@ export const Default: Layer.Layer<
           { name: "Leaf", path: "src/Leaf.ts", line: 1 }
         ],
         layers: [
-          { name: "S1Live", serviceName: "S1", path: "src/S1.ts", line: 1, dependencies: ["SharedDep"], errorTypes: [] },
-          { name: "S2Live", serviceName: "S2", path: "src/S2.ts", line: 1, dependencies: ["SharedDep"], errorTypes: [] },
-          { name: "S3Live", serviceName: "S3", path: "src/S3.ts", line: 1, dependencies: ["Leaf"], errorTypes: [] },
-          { name: "S4Live", serviceName: "S4", path: "src/S4.ts", line: 1, dependencies: ["Leaf"], errorTypes: [] },
-          { name: "SharedDepLive", serviceName: "SharedDep", path: "src/SharedDep.ts", line: 1, dependencies: ["Leaf"], errorTypes: [] },
-          { name: "LeafLive", serviceName: "Leaf", path: "src/Leaf.ts", line: 1, dependencies: [], errorTypes: [] }
+          { name: "S1Live", serviceName: "S1", path: "src/S1.ts", line: 1, dependencies: ["SharedDep"], errorTypes: [],
+          isParametrized: false },
+          { name: "S2Live", serviceName: "S2", path: "src/S2.ts", line: 1, dependencies: ["SharedDep"], errorTypes: [],
+          isParametrized: false },
+          { name: "S3Live", serviceName: "S3", path: "src/S3.ts", line: 1, dependencies: ["Leaf"], errorTypes: [],
+          isParametrized: false },
+          { name: "S4Live", serviceName: "S4", path: "src/S4.ts", line: 1, dependencies: ["Leaf"], errorTypes: [],
+          isParametrized: false },
+          { name: "SharedDepLive", serviceName: "SharedDep", path: "src/SharedDep.ts", line: 1, dependencies: ["Leaf"], errorTypes: [],
+          isParametrized: false },
+          { name: "LeafLive", serviceName: "Leaf", path: "src/Leaf.ts", line: 1, dependencies: [], errorTypes: [],
+          isParametrized: false }
         ]
       }
 
@@ -2639,6 +2974,74 @@ export const Default: Layer.Layer<
       expect(sharedDep1!.affectedBy).toContain("ServiceA")
       expect(sharedDep1!.affectedBy).toContain("ServiceB")
       expect(sharedDep1!.affectedBy).toContain("ServiceC")
+    })
+  })
+
+  describe("Factory Rendering in Adjacency List", () => {
+    const graphWithFactory: ArchitectureGraph = {
+      services: [
+        { name: "FactoryService", path: "factory.ts", line: 1 },
+        { name: "DependencyService", path: "dep.ts", line: 1 }
+      ],
+      layers: [
+        {
+          name: "FactoryServiceLive",
+          serviceName: "FactoryService",
+          path: "factory.live.ts",
+          line: 1,
+          dependencies: ["DependencyService"],
+          errorTypes: [],
+          isParametrized: true
+        },
+        {
+          name: "DependencyServiceLive",
+          serviceName: "DependencyService",
+          path: "dep.live.ts",
+          line: 1,
+          dependencies: [],
+          errorTypes: [],
+          isParametrized: false
+        }
+      ]
+    }
+
+    const graphWithStatic: ArchitectureGraph = {
+      services: [
+        { name: "StaticService", path: "static.ts", line: 1 },
+        { name: "DependencyService", path: "dep.ts", line: 1 }
+      ],
+      layers: [
+        {
+          name: "StaticServiceLive",
+          serviceName: "StaticService",
+          path: "static.live.ts",
+          line: 1,
+          dependencies: ["DependencyService"],
+          errorTypes: [],
+          isParametrized: false
+        },
+        {
+          name: "DependencyServiceLive",
+          serviceName: "DependencyService",
+          path: "dep.live.ts",
+          line: 1,
+          dependencies: [],
+          errorTypes: [],
+          isParametrized: false
+        }
+      ]
+    }
+
+    it("renders () => prefix for factory functions in agent format", () => {
+      const output = formatAgent(graphWithFactory)
+      expect(output).toContain("() => FactoryService<")
+      expect(output).not.toContain("() => DependencyService<")
+    })
+
+    it("does not render () => prefix for static layers in agent format", () => {
+      const output = formatAgent(graphWithStatic)
+      expect(output).toContain("StaticService<")
+      expect(output).not.toContain("() => StaticService<")
     })
   })
 })

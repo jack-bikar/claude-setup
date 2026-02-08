@@ -58,13 +58,14 @@ const analyzeCommand = Command.make(
   ({ metrics, domains, advanced, warnings, workflows, all }) =>
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const output = analyzer.formatAgentWithHints(graph, {
           showMetrics: all || metrics,
           showDomains: all || domains,
           showAdvanced: all || advanced,
           showWarnings: all || warnings,
-          showWorkflows: all || workflows
+          showWorkflows: all || workflows,
+          showCommands: all
         })
         yield* Console.log(output)
       })
@@ -79,7 +80,7 @@ const blastRadiusCommand = Command.make(
   ({ service }) =>
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const analysisGraph = analyzer.buildAnalysisGraph(graph)
         const result = analyzer.computeBlastRadius(analysisGraph, service)
         yield* pipe(
@@ -102,7 +103,7 @@ const commonAncestorsCommand = Command.make(
   ({ services }) =>
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const analysisGraph = analyzer.buildAnalysisGraph(graph)
         const result = analyzer.computeCommonAncestors(analysisGraph, services)
         yield* Console.log(analyzer.renderCommonAncestors(result))
@@ -118,7 +119,7 @@ const ancestorsCommand = Command.make(
   ({ service }) =>
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const analysisGraph = analyzer.buildAnalysisGraph(graph)
         const result = analyzer.computeAncestors(analysisGraph, service)
         yield* pipe(
@@ -143,7 +144,7 @@ const metricsCommand = Command.make(
       Effect.gen(function* () {
         yield* Console.log("<hint>Tip: Use 'architecture analyze --metrics' to see this in full context</hint>")
         yield* Console.log("")
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const fullOutput = analyzer.formatAgent(graph)
         const metricsMatch = fullOutput.match(/<metrics>[\s\S]*?<\/metrics>/)
         yield* Console.log(metricsMatch?.[0] ?? "<metrics />")
@@ -159,7 +160,7 @@ const domainsCommand = Command.make(
   () =>
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const fullOutput = analyzer.formatAgent(graph)
         const domainsMatch = fullOutput.match(/<domains[\s\S]*?<\/domains>/)
         yield* Console.log(domainsMatch?.[0] ?? "<domains />")
@@ -175,7 +176,7 @@ const hotServicesCommand = Command.make(
   () =>
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
         const fullOutput = analyzer.formatAgent(graph)
         const hotMatch = fullOutput.match(/<hot[\s\S]*?<\/hot>/)
         yield* Console.log(hotMatch?.[0] ?? "<hot />")
@@ -209,7 +210,7 @@ const formatCommand = Command.make(
     runInProjectRoot((_root, analyzer) =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
-        const graph = yield* analyzer.buildArchitectureGraph
+        const graph = yield* analyzer.buildArchitectureGraph("./src")
 
         const content =
           format === "mermaid"

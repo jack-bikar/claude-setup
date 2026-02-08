@@ -390,9 +390,6 @@ success task = typesPass task ∧ testsPass task
 -- Implementation agents: run gates directly (via Bash)
 -- Orchestrating agents: DELEGATE gates to implementation agents
 -- Everything else: delegate
-
--- For significant changes (multiple files, architectural impact):
--- Invoke /legal-review before finalizing
 </gates>
 
 <todo_enforcement>
@@ -738,9 +735,6 @@ success task = typesPass task ∧ testsPass task
 -- Implementation agents: run gates directly (via Bash)
 -- Orchestrating agents: DELEGATE gates to implementation agents
 -- Everything else: delegate
-
--- For significant changes (multiple files, architectural impact):
--- Invoke /legal-review before finalizing
 </gates>
 
 <todo_enforcement>

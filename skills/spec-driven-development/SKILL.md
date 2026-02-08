@@ -639,8 +639,6 @@ Gate: tests pass (DELEGATE to agent)
 
 **Quality gates**: Gates (typecheck, test) SHALL be delegated to agents — do not run directly from orchestrating agent.
 
-**Legal review**: For significant changes (multiple files, architectural impact), perform `/legal-review` before finalizing implementation.
-
 **After completion**:
 1. Present implementation summary
 2. Show test results

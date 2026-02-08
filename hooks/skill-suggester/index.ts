@@ -12,14 +12,23 @@
  * @since 1.0.0
  */
 
-import { Effect, Console, pipe, Array, Record, Option, String } from "effect"
+import { Effect, Console, pipe, Array, Record, Option, String, Order } from "effect"
 import { Terminal, FileSystem, Path, Command, CommandExecutor } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { UserPromptInput } from "../schemas"
 import * as Schema from "effect/Schema"
 import * as fs from "fs"
 
-interface SkillMetadata {
+const LenientUserPromptInput = Schema.Struct({
+  session_id: Schema.String,
+  transcript_path: Schema.optionalWith(Schema.String, { default: () => "" }),
+  cwd: Schema.String,
+  permission_mode: Schema.optionalWith(Schema.String, { default: () => "default" }),
+  hook_event_name: Schema.Literal("UserPromptSubmit"),
+  prompt: Schema.optionalWith(Schema.String, { default: () => "" }),
+  user_prompt: Schema.optionalWith(Schema.String, { default: () => "" }),
+})
+
+export interface SkillMetadata {
   readonly name: string
   readonly keywords: ReadonlyArray<string>
 }
@@ -28,9 +37,10 @@ interface HookState {
   readonly lastCallMs: number | null
 }
 
-const readHookState = (): HookState => {
+const readHookState = (cwd: string): HookState => {
   try {
-    const content = fs.readFileSync(".claude/.hook-state.json", "utf-8")
+    const statePath = `${cwd}/.claude/.hook-state.json`
+    const content = fs.readFileSync(statePath, "utf-8")
     const parsed = JSON.parse(content)
     return { lastCallMs: typeof parsed.lastCallMs === "number" ? parsed.lastCallMs : null }
   } catch {
@@ -38,11 +48,11 @@ const readHookState = (): HookState => {
   }
 }
 
-const writeHookState = (state: HookState): void => {
+const writeHookState = (cwd: string, state: HookState): void => {
   try {
-    fs.writeFileSync(".claude/.hook-state.json", JSON.stringify(state, null, 2), "utf-8")
-  } catch (error) {
-    // Silently fail if we can't write state
+    const statePath = `${cwd}/.claude/.hook-state.json`
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2), "utf-8")
+  } catch {
   }
 }
 
@@ -116,17 +126,20 @@ const parseFrontmatter = (content: string): Record.ReadonlyRecord<string, string
   return Record.fromEntries(entries)
 }
 
-const extractKeywords = (text: string): ReadonlyArray<string> => {
-  const commonWords = new Set([
-    "the", "and", "for", "with", "using", "that", "this", "from",
-    "are", "can", "will", "use", "used", "make", "makes", "create", "run"
-  ])
+export const STOPWORDS = new Set([
+  "the", "and", "for", "with", "using", "that", "this", "from",
+  "are", "can", "will", "use", "used", "make", "makes", "create", "run",
+  "effect", "service", "implement", "implementation", "design", "pattern", "patterns",
+  "when", "working", "code", "type", "types", "build", "handle", "handling",
+  "write", "writing", "module", "modules", "define", "defining"
+])
 
+export const extractKeywords = (text: string): ReadonlyArray<string> => {
   const lowercased = String.toLowerCase(text)
   const words = String.split(lowercased, /[\s,.-]+/)
 
   return Array.filter(words, word =>
-    String.length(word) >= 3 && !commonWords.has(word)
+    String.length(word) >= 3 && !STOPWORDS.has(word)
   )
 }
 
@@ -154,11 +167,11 @@ const readSkillFile = (skillPath: string) =>
     return { name, keywords }
   })
 
-const loadSkills = Effect.gen(function* () {
+const loadSkills = (cwd: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
 
-  const skillsDir = path.join(".claude", "skills")
+  const skillsDir = path.join(cwd, ".claude", "skills")
   const exists = yield* fs.exists(skillsDir)
 
   if (!exists) return Array.empty<SkillMetadata>()
@@ -172,17 +185,54 @@ const loadSkills = Effect.gen(function* () {
   return Array.getSomes(skillOptions)
 })
 
-const matchesKeyword = (prompt: string, keyword: string): boolean =>
-  pipe(String.toLowerCase(prompt), String.includes(String.toLowerCase(keyword)))
+export const matchesWordBoundary = (prompt: string, word: string): boolean => {
+  const pattern = new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i")
+  return pattern.test(prompt)
+}
 
-const findMatchingSkills = (
+export const MAX_SUGGESTIONS = 5
+export const MIN_SCORE = 2
+export const NAME_MATCH_BOOST = 3
+export const KEYWORD_MATCH_SCORE = 1
+
+export const scoreSkill = (
+  prompt: string,
+  skill: SkillMetadata
+): number => {
+  const nameSegments = pipe(
+    String.toLowerCase(skill.name),
+    String.split(/-/)
+  )
+
+  const nameScore = pipe(
+    nameSegments,
+    Array.filter(seg => String.length(seg) >= 3),
+    Array.filter(seg => matchesWordBoundary(prompt, seg)),
+    Array.length,
+    n => n * NAME_MATCH_BOOST
+  )
+
+  const keywordScore = pipe(
+    skill.keywords,
+    Array.filter(keyword => matchesWordBoundary(prompt, keyword)),
+    Array.length,
+    n => n * KEYWORD_MATCH_SCORE
+  )
+
+  return nameScore + keywordScore
+}
+
+export const findMatchingSkills = (
   prompt: string,
   skills: ReadonlyArray<SkillMetadata>
 ): ReadonlyArray<string> =>
-  Array.filterMap(skills, skill =>
-    Array.some(skill.keywords, keyword => matchesKeyword(prompt, keyword))
-      ? Option.some(skill.name)
-      : Option.none()
+  pipe(
+    skills,
+    Array.map(skill => ({ skill, score: scoreSkill(prompt, skill) })),
+    Array.filter(({ score }) => score >= MIN_SCORE),
+    Array.sort(Order.mapInput(Order.reverse(Order.number), (entry: { skill: SkillMetadata; score: number }) => entry.score)),
+    Array.take(MAX_SUGGESTIONS),
+    Array.map(({ skill }) => skill.name)
   )
 
 const searchModules = (prompt: string, cwd: string) =>
@@ -231,18 +281,18 @@ const formatOutput = (context: string) =>
   )
 
 const program = Effect.gen(function* () {
-  // File-based state tracking for debouncing
-  const previousState = readHookState()
-  const currentCallMs = Date.now()
-
-  writeHookState({ lastCallMs: currentCallMs })
-
-  const skills = yield* loadSkills
   const terminal = yield* Terminal.Terminal
 
   const stdin = yield* terminal.readLine
-  const input = yield* Schema.decode(Schema.parseJson(UserPromptInput))(stdin)
+  const raw = yield* Schema.decode(Schema.parseJson(LenientUserPromptInput))(stdin)
+  const prompt = raw.prompt || raw.user_prompt || ""
+  const input = { ...raw, prompt }
 
+  const previousState = readHookState(input.cwd)
+  const currentCallMs = Date.now()
+  writeHookState(input.cwd, { lastCallMs: currentCallMs })
+
+  const skills = yield* loadSkills(input.cwd)
   const matchingSkills = findMatchingSkills(input.prompt, skills)
 
   // Search for matching modules based on user input
@@ -383,8 +433,6 @@ test :: Package → Effect Result
 test pkg = Bash "mise run test:pkg"
 
 -- Report success ONLY when both pass
--- For significant changes (multiple files, architectural impact):
--- Invoke /legal-review before finalizing
 </GATES>`)
 
   parts.push(`<TODO_ENFORCEMENT>

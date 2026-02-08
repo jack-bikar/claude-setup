@@ -72,12 +72,15 @@
     "description": "Functional programming with Effect TypeScript"
   },
   "defaults": {
-    "model": "sonnet"
+    "model": "opus"
   },
   "agents": {
     "autoInvoke": true
   },
   "enabledPlugins": {
     "typescript-lsp@claude-plugins-official": true
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   }
 }

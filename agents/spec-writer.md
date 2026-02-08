@@ -68,7 +68,6 @@ behavioral-spec:  behaviors.test.ts := executable(specification) ^ not(afterthou
 
 -- Gate delegation laws
 gate-delegation:  gates(typecheck, test) SHALL be delegated(agent) ^ not(run-directly)
-legal-review:     significant(changes) => invoke(/legal-review) before finalize
 
 -- Critical constraint
 never-implement:  start(Implementation) requires explicit-user-authorization
@@ -212,8 +211,6 @@ phase6 plan = do
     implement(task)
     delegate("bun run format && bun run typecheck")  -- gates DELEGATED to agents
     update(plan.md, task.status := Complete)
-  -- For significant changes, perform legal review
-  when(significant(changes)) -> invoke(/legal-review)
   pure(ImplementedCode)
 </phase6>
 
@@ -306,7 +303,6 @@ forall output:
   ^ traceability-maintained
   ^ user-approval-before-implementation
   ^ quality-gates-delegated           -- typecheck/test gates delegated to agents
-  ^ legal-review-for-significant      -- /legal-review for multi-file or architectural changes
 </invariants>
 
 </spec-mind>

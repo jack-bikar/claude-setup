@@ -36,3 +36,8 @@ tmp/
 
 # md-typecheck output
 scripts/md-typecheck-output/
+
+# Ignore all markdown files except CLAUDE.md and README.md
+*.md
+!CLAUDE.md
+!README.md
